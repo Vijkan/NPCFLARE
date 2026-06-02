@@ -3,9 +3,6 @@ set -e
 
 debug=false
 
-source keys.sh
-num_keys=${#keys[@]}
-
 dataset=$1
 config_file=$2
 
@@ -14,7 +11,7 @@ config_filename="${config_filename%.*}"
 
 debug_batch_size=1
 batch_size=8
-model=text-davinci-003
+model=${OLLAMA_MODEL:-llama3}
 temperature=0
 
 output=output/${dataset}/${model}/${config_filename}.jsonl
@@ -78,19 +75,9 @@ if [[ ${debug} == "true" ]]; then
         --output test.jsonl \
         --num_shards 1 \
         --shard_id 0 \
-        --openai_keys ${test_key} \
         --debug
     exit
 fi
-
-function join_by {
-  local d=${1-} f=${2-}
-  if shift 2; then
-    printf %s "$f" "${@/#/$d}"
-  fi
-}
-
-joined_keys=$(join_by " " "${keys[@]:0:${num_keys}}")
 
 python -m src.openai_api \
     --model ${model} \
@@ -106,4 +93,3 @@ python -m src.openai_api \
     --output ${output} \
     --num_shards 1 \
     --shard_id 0 \
-    --openai_keys ${joined_keys} \
