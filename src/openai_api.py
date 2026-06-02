@@ -55,7 +55,7 @@ class KeyManager:
                 break
         if not found_key_not_inuse:
             self.next_available_key_ind = None
-        logging.info(f'get key idx {self.key2ind[to_return]} next avai {self.next_available_key_ind}')
+        logging.info('get key done')
         return to_return
 
     def return_key(self, key, time_spent: float = None, forbid: bool = False):
@@ -220,7 +220,7 @@ class QueryAgent:
             assert len(queries) == 1, 'chatgpt doesn\'t support batching'
             if 'max_tokens' in params:
                 params['max_tokens'] = max(1, params['max_tokens'])  # 0 is not allowed for chatgpt
-            def process_chatgpt(message: str):
+            def process_chat_response(message: str):
                 if message:
                     return ' ' + message
                 return message
@@ -287,7 +287,7 @@ class QueryAgent:
 
             generations = []
             for r, (q, _, _) in zip(responses['choices'], prompts):
-                chat_content = process_chatgpt(r.get('message', {}).get('content', ''))
+                chat_content = process_chat_response(r.get('message', {}).get('content', ''))
                 generations.append(ApiReturn(
                     prompt=q,
                     text=(prefixes[0][0] + chat_content) if echo else chat_content,  # TODO: corner case where space does not work?

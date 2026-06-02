@@ -52,7 +52,7 @@ def retry_with_exponential_backoff(
     exponential_base: float = 2,
     jitter: bool = True,
     max_retries: int = 5,
-    errors_to_catch: tuple = (urllib.error.URLError, TimeoutError, ConnectionError, NoKeyAvailable),
+    errors_to_catch: tuple = (urllib.error.URLError, NoKeyAvailable),
     errors_to_raise: tuple = (),
 ):
     """Retry a function with exponential backoff."""
@@ -221,9 +221,9 @@ def openai_api_call(*args, **kwargs):
     request_kwargs = dict(kwargs)
     request_kwargs.pop('model', None)
     if is_chat_model:
-        if len(request_kwargs['messages']) <= 0:
-            return []
         messages = request_kwargs.pop('messages')
+        if not messages:
+            return []
         if isinstance(messages[0], list):  # batch request
             return asyncio.run(async_chatgpt(messages=messages, model=resolved_model, **request_kwargs))
         else:
@@ -237,6 +237,12 @@ def openai_api_call(*args, **kwargs):
                     executor.submit(_ollama_text_completion, item, resolved_model, **request_kwargs)
                     for item in prompt
                 ]
-                choices = [future.result()['choices'][0] for future in futures]
+                choices = [None] * len(futures)
+                for idx, future in enumerate(futures):
+                    try:
+                        response = future.result()
+                    except Exception as exc:
+                        raise RuntimeError(f'Ollama completion failed for prompt index {idx}') from exc
+                    choices[idx] = response['choices'][0]
             return {'model': resolved_model, 'choices': choices}
         return _ollama_text_completion(prompt, resolved_model, **request_kwargs)
