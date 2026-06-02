@@ -18,6 +18,7 @@ from .templates import CtxPrompt, ApiReturn, RetrievalInstruction
 from .datasets import StrategyQA, WikiMultiHopQA, WikiAsp, ASQA
 from .utils import Utils, NoKeyAvailable, openai_api_call, OLLAMA_MODEL
 logging.basicConfig(level=logging.INFO)
+LOCAL_API_KEY_PLACEHOLDER = 'local-ollama'
 
 
 class CustomManager(BaseManager):
@@ -650,7 +651,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=2022)
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
-    args.openai_keys = args.openai_keys or ['ollama']
+    args.openai_keys = args.openai_keys or [LOCAL_API_KEY_PLACEHOLDER]
     args.multiprocess = len(args.openai_keys) > 1
     random.seed(args.seed)
     np.random.seed(args.seed)

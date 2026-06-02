@@ -6,6 +6,7 @@ import logging
 import copy
 import string
 import asyncio
+import concurrent.futures
 import json
 import urllib.request
 import urllib.error
@@ -15,6 +16,13 @@ OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip(
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3')
 OLLAMA_CHAT_MODEL = os.getenv('OLLAMA_CHAT_MODEL', OLLAMA_MODEL)
 OLLAMA_TIMEOUT = float(os.getenv('OLLAMA_TIMEOUT', '120'))
+OPENAI_MODEL_ALIASES = {
+    'code-davinci-002',
+    'text-davinci-002',
+    'text-davinci-003',
+    'gpt-3.5-turbo-0301',
+    'gpt-3.5-turbo',
+}
 
 
 class Utils:
@@ -111,7 +119,7 @@ def retry_with_exponential_backoff(
 
 
 def _is_openai_model(model: str) -> bool:
-    return model.startswith(('gpt-', 'text-', 'code-')) or 'turbo' in model
+    return model in OPENAI_MODEL_ALIASES
 
 
 def _resolve_ollama_model(model: str, is_chat_model: bool) -> str:
@@ -143,8 +151,11 @@ def _ollama_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         data=json.dumps(payload).encode('utf-8'),
         headers={'Content-Type': 'application/json'},
     )
-    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
-        return json.loads(response.read().decode('utf-8'))
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.URLError as exc:
+        raise urllib.error.URLError(f'Ollama request failed for {endpoint}: {exc}') from exc
 
 
 def _ollama_chat_completion(messages: List[Dict[str, Any]], model: str, **kwargs) -> Dict[str, Any]:
@@ -195,10 +206,11 @@ async def async_chatgpt(
     model: str,
     **kwargs,
 ) -> List[Dict[str, Any]]:
-    responses = []
-    for message_set in messages:
-        responses.append(_ollama_chat_completion(message_set, model=model, **kwargs))
-    return responses
+    tasks = [
+        asyncio.to_thread(_ollama_chat_completion, message_set, model=model, **kwargs)
+        for message_set in messages
+    ]
+    return await asyncio.gather(*tasks)
 
 
 @retry_with_exponential_backoff
@@ -220,9 +232,11 @@ def openai_api_call(*args, **kwargs):
         prompt = request_kwargs['prompt']
         request_kwargs.pop('prompt', None)
         if isinstance(prompt, list):
-            choices = []
-            for item in prompt:
-                response = _ollama_text_completion(item, resolved_model, **request_kwargs)
-                choices.append(response['choices'][0])
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(_ollama_text_completion, item, resolved_model, **request_kwargs)
+                    for item in prompt
+                ]
+                choices = [future.result()['choices'][0] for future in futures]
             return {'model': resolved_model, 'choices': choices}
         return _ollama_text_completion(prompt, resolved_model, **request_kwargs)
