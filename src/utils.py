@@ -6,23 +6,8 @@ import logging
 import copy
 import string
 import asyncio
-import concurrent.futures
-import json
-import urllib.request
-import urllib.error
+import openai
 logging.basicConfig(level=logging.INFO)
-
-OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip('/')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3')
-OLLAMA_CHAT_MODEL = os.getenv('OLLAMA_CHAT_MODEL', OLLAMA_MODEL)
-OLLAMA_TIMEOUT = float(os.getenv('OLLAMA_TIMEOUT', '120'))
-OPENAI_MODEL_ALIASES = frozenset({
-    'code-davinci-002',
-    'text-davinci-002',
-    'text-davinci-003',
-    'gpt-3.5-turbo-0301',
-    'gpt-3.5-turbo',
-})
 
 
 class Utils:
@@ -52,8 +37,8 @@ def retry_with_exponential_backoff(
     exponential_base: float = 2,
     jitter: bool = True,
     max_retries: int = 5,
-    errors_to_catch: tuple = (urllib.error.URLError, NoKeyAvailable),
-    errors_to_raise: tuple = (),
+    errors_to_catch: tuple = (openai.error.RateLimitError, openai.error.ServiceUnavailableError, openai.error.APIError, openai.error.Timeout, NoKeyAvailable),
+    errors_to_raise: tuple = (openai.error.APIConnectionError, openai.error.InvalidRequestError, openai.error.AuthenticationError),
 ):
     """Retry a function with exponential backoff."""
     def wrapper(*args, **kwargs):
@@ -80,18 +65,26 @@ def retry_with_exponential_backoff(
                         get_key_func, return_key_func = ori_api_key
                         api_key = get_key_func()
                     else:  # a specified key
-                        api_key = ori_api_key
+                        api_key = ori_api_key or os.getenv('OPENAI_API_KEY')
                     _kwargs['api_key'] = api_key
 
                 # query API
                 start_t = time.time()
-                logging.info('API call start')
+                logging.info(f'API call start: {_kwargs.get("api_key", "")[-5:]}')
                 results = func(*args, **_kwargs)
-                logging.info('API call end')
+                logging.info(f'API call end: {_kwargs.get("api_key", "")[-5:]}')
                 return results
 
             # retry on specific errors
             except errors_to_catch as e:
+                # check if the key is useless
+                if hasattr(e, 'json_body') and e.json_body is not None and 'error' in e.json_body and 'type' in e.json_body['error'] and e.json_body['error']['type'] == 'insufficient_quota':  # quota error
+                    logging.info(f'NO QUOTA: {api_key[-5:]}')
+                    forbid_key = True
+                if hasattr(e, 'json_body') and e.json_body is not None and 'error' in e.json_body and 'type' in e.json_body['error'] and e.json_body['error']['code'] == 'account_deactivated':  # ban error
+                    logging.info(f'BAN: {api_key[-5:]}')
+                    forbid_key = True
+
                 # check num of retries
                 num_retries += 1
                 if num_retries > max_retries:
@@ -118,131 +111,32 @@ def retry_with_exponential_backoff(
     return wrapper
 
 
-def _is_openai_model(model: str) -> bool:
-    return model in OPENAI_MODEL_ALIASES
-
-
-def _resolve_ollama_model(model: str, is_chat_model: bool) -> str:
-    if _is_openai_model(model):
-        return OLLAMA_CHAT_MODEL if is_chat_model else OLLAMA_MODEL
-    return model
-
-
-def _ollama_options_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    options: Dict[str, Any] = {}
-    if 'temperature' in kwargs and kwargs['temperature'] is not None:
-        options['temperature'] = kwargs['temperature']
-    if 'top_p' in kwargs and kwargs['top_p'] is not None:
-        options['top_p'] = kwargs['top_p']
-    if 'max_tokens' in kwargs and kwargs['max_tokens'] is not None:
-        options['num_predict'] = kwargs['max_tokens']
-    stop = kwargs.get('stop')
-    if stop:
-        if isinstance(stop, str):
-            options['stop'] = [stop]
-        else:
-            options['stop'] = stop
-    return options
-
-
-def _ollama_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.URLError as exc:
-        raise urllib.error.URLError(f'Ollama request failed for {endpoint}: {str(exc)}') from exc
-
-
-def _ollama_chat_completion(messages: List[Dict[str, Any]], model: str, **kwargs) -> Dict[str, Any]:
-    options = _ollama_options_from_kwargs(kwargs)
-    payload = {
-        'model': model,
-        'messages': messages,
-        'stream': False,
-    }
-    if options:
-        payload['options'] = options
-    response = _ollama_request(f'{OLLAMA_BASE_URL}/api/chat', payload)
-    return {
-        'model': response.get('model', model),
-        'choices': [{
-            'message': {'content': response.get('message', {}).get('content', '')},
-            'finish_reason': response.get('done_reason', 'stop'),
-        }],
-    }
-
-
-def _ollama_text_completion(prompt: str, model: str, **kwargs) -> Dict[str, Any]:
-    options = _ollama_options_from_kwargs(kwargs)
-    payload = {
-        'model': model,
-        'prompt': prompt,
-        'stream': False,
-    }
-    if options:
-        payload['options'] = options
-    response = _ollama_request(f'{OLLAMA_BASE_URL}/api/generate', payload)
-    text = response.get('response', '')
-    if kwargs.get('echo'):
-        text = f'{prompt}{text}'
-    return {
-        'model': response.get('model', model),
-        'choices': [{
-            'text': text,
-            'finish_reason': response.get('done_reason', 'stop'),
-            'logprobs': None,
-        }],
-    }
-
-
 async def async_chatgpt(
     *args,
     messages: List[List[Dict[str, Any]]],
-    model: str,
     **kwargs,
-) -> List[Dict[str, Any]]:
-    tasks = [
-        asyncio.to_thread(_ollama_chat_completion, message_set, model=model, **kwargs)
-        for message_set in messages
+) -> List[str]:
+    async_responses = [
+        openai.ChatCompletion.acreate(
+            *args,
+            messages=x,
+            **kwargs,
+        )
+        for x in messages
     ]
-    return await asyncio.gather(*tasks)
+    return await asyncio.gather(*async_responses)
 
 
 @retry_with_exponential_backoff
 def openai_api_call(*args, **kwargs):
     model = kwargs['model']
     is_chat_model = Utils.is_chat(model)
-    resolved_model = _resolve_ollama_model(model, is_chat_model)
-    request_kwargs = dict(kwargs)
-    request_kwargs.pop('model', None)
     if is_chat_model:
-        messages = request_kwargs.pop('messages')
-        if not messages:
+        if len(kwargs['messages']) <= 0:
             return []
-        if isinstance(messages[0], list):  # batch request
-            return asyncio.run(async_chatgpt(messages=messages, model=resolved_model, **request_kwargs))
+        if type(kwargs['messages'][0]) is list:  # batch request
+            return asyncio.run(async_chatgpt(*args, **kwargs))
         else:
-            return _ollama_chat_completion(messages, resolved_model, **request_kwargs)
+            return openai.ChatCompletion.create(*args, **kwargs)
     else:
-        prompt = request_kwargs['prompt']
-        request_kwargs.pop('prompt', None)
-        if isinstance(prompt, list):
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = [
-                    executor.submit(_ollama_text_completion, item, resolved_model, **request_kwargs)
-                    for item in prompt
-                ]
-                choices = [None] * len(futures)
-                for idx, future in enumerate(futures):
-                    try:
-                        response = future.result()
-                    except Exception as exc:
-                        raise RuntimeError(f'Ollama completion failed for prompt index {idx}') from exc
-                    choices[idx] = response['choices'][0]
-            return {'model': resolved_model, 'choices': choices}
-        return _ollama_text_completion(prompt, resolved_model, **request_kwargs)
+        return openai.Completion.create(*args, **kwargs)

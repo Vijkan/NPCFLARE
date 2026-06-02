@@ -16,9 +16,8 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 from .retriever import BM25
 from .templates import CtxPrompt, ApiReturn, RetrievalInstruction
 from .datasets import StrategyQA, WikiMultiHopQA, WikiAsp, ASQA
-from .utils import Utils, NoKeyAvailable, openai_api_call, OLLAMA_MODEL
+from .utils import Utils, NoKeyAvailable, openai_api_call
 logging.basicConfig(level=logging.INFO)
-LOCAL_API_KEY_PLACEHOLDER = 'local-ollama'
 
 
 class CustomManager(BaseManager):
@@ -55,7 +54,7 @@ class KeyManager:
                 break
         if not found_key_not_inuse:
             self.next_available_key_ind = None
-        logging.info('get key done')
+        logging.info(f'get key {to_return[-5:]} next avai {self.next_available_key_ind}')
         return to_return
 
     def return_key(self, key, time_spent: float = None, forbid: bool = False):
@@ -76,7 +75,7 @@ class KeyManager:
     def get_report(self):
         report: List[str] = []
         for key in self.keys:
-            report.append(f'key#{self.key2ind[key]}\t{len(self.key2times[key])}\t{np.mean(self.key2times[key])}\t{key in self.forbid_keys}')
+            report.append(f'{key}\t{len(self.key2times[key])}\t{np.mean(self.key2times[key])}\t{key in self.forbid_keys}')
         return '\n'.join(report)
 
 
@@ -220,7 +219,7 @@ class QueryAgent:
             assert len(queries) == 1, 'chatgpt doesn\'t support batching'
             if 'max_tokens' in params:
                 params['max_tokens'] = max(1, params['max_tokens'])  # 0 is not allowed for chatgpt
-            def process_chat_response(message: str):
+            def process_chatgpt(message: str):
                 if message:
                     return ' ' + message
                 return message
@@ -285,15 +284,12 @@ class QueryAgent:
                 frequency_penalty=self.frequency_penalty,
                 **params)
 
-            generations = []
-            for r, (q, _, _) in zip(responses['choices'], prompts):
-                chat_content = process_chat_response(r.get('message', {}).get('content', ''))
-                generations.append(ApiReturn(
-                    prompt=q,
-                    text=(prefixes[0][0] + chat_content) if echo else chat_content,  # TODO: corner case where space does not work?
-                    finish_reason='length' if echo else r.get('finish_reason'),  # never stop in echo mode
-                    model=responses.get('model', self.model),
-                    skip_len=0))
+            generations = [ApiReturn(
+                prompt=q,
+                text=(prefixes[0][0] + process_chatgpt(r['message']['content'])) if echo else process_chatgpt(r['message']['content']),  # TODO: corner case where space does not work?
+                finish_reason='length' if echo else r['finish_reason'],  # never stop in echo mode
+                model=responses['model'],
+                skip_len=0) for r, (q, _, _) in zip(responses['choices'], prompts)]
         else:
             responses = openai_api_call(
                 api_key=api_key,
@@ -307,25 +303,15 @@ class QueryAgent:
                 echo=echo,
                 **params)
 
-            generations = []
-            for r, (q, _, _) in zip(responses['choices'], prompts):
-                logprobs = r.get('logprobs') or {}
-                tokens = logprobs.get('tokens')
-                if tokens is not None:
-                    probs = [np.exp(lp) if lp is not None else lp for lp in logprobs.get('token_logprobs', [])]
-                    offsets = logprobs.get('text_offset', [])
-                else:
-                    probs = None
-                    offsets = None
-                generations.append(ApiReturn(
-                    prompt=q,
-                    text=r.get('text', ''),
-                    tokens=tokens,
-                    probs=probs,
-                    offsets=offsets,
-                    finish_reason='length' if echo else r.get('finish_reason'),  # never stop in echo mode
-                    model=responses.get('model', self.model),
-                    skip_len=len(q) if echo else 0))
+            generations = [ApiReturn(
+                prompt=q,
+                text=r['text'],
+                tokens=r['logprobs']['tokens'],
+                probs=[np.exp(lp) if lp is not None else lp for lp in r['logprobs']['token_logprobs']],
+                offsets=r['logprobs']['text_offset'],
+                finish_reason='length' if echo else r['finish_reason'],  # never stop in echo mode
+                model=responses['model'],
+                skip_len=len(q) if echo else 0) for r, (q, _, _) in zip(responses['choices'], prompts)]
 
         if self.debug:
             print('Params ->', params)
@@ -632,13 +618,13 @@ def write_worker(output_file: str, output_queue: Queue, size: int = None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='strategyqa', choices=['strategyqa', '2wikihop', 'wikiasp', 'asqa'])
-    parser.add_argument('--model', type=str, default=OLLAMA_MODEL)
+    parser.add_argument('--model', type=str, default='text-davinci-003', choices=['code-davinci-002', 'text-davinci-002', 'text-davinci-003', 'gpt-3.5-turbo-0301'])
     parser.add_argument('--input', type=str, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--index_name', type=str, default='test')
     parser.add_argument('--shard_id', type=int, default=0)
     parser.add_argument('--num_shards', type=int, default=1)
-    parser.add_argument('--openai_keys', type=str, default=[], help='openai keys (optional for Ollama)', nargs='+')
+    parser.add_argument('--openai_keys', type=str, default=[], help='openai keys', nargs='+')
     parser.add_argument('--config_file', type=str, default=None, help='config file')
     parser.add_argument('--config_kvs', type=str, default=None, help='extra config json, used to override config_file')
     parser.add_argument('--search_engine', type=str, default='elasticsearch', choices=['bing', 'elasticsearch'])
@@ -654,7 +640,6 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=2022)
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
-    args.openai_keys = args.openai_keys or [LOCAL_API_KEY_PLACEHOLDER]
     args.multiprocess = len(args.openai_keys) > 1
     random.seed(args.seed)
     np.random.seed(args.seed)

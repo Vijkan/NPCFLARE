@@ -1,3 +1,4 @@
+openai
 transformers==4.24.0
 beir==1.0.1
 datasets
