@@ -16,13 +16,13 @@ OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip(
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3')
 OLLAMA_CHAT_MODEL = os.getenv('OLLAMA_CHAT_MODEL', OLLAMA_MODEL)
 OLLAMA_TIMEOUT = float(os.getenv('OLLAMA_TIMEOUT', '120'))
-OPENAI_MODEL_ALIASES = {
+OPENAI_MODEL_ALIASES = frozenset({
     'code-davinci-002',
     'text-davinci-002',
     'text-davinci-003',
     'gpt-3.5-turbo-0301',
     'gpt-3.5-turbo',
-}
+})
 
 
 class Utils:
@@ -155,7 +155,7 @@ def _ollama_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.URLError as exc:
-        raise urllib.error.URLError(f'Ollama request failed for {endpoint}: {exc}') from exc
+        raise urllib.error.URLError(f'Ollama request failed for {endpoint}: {str(exc)}') from exc
 
 
 def _ollama_chat_completion(messages: List[Dict[str, Any]], model: str, **kwargs) -> Dict[str, Any]:

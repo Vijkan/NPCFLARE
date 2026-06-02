@@ -55,7 +55,7 @@ class KeyManager:
                 break
         if not found_key_not_inuse:
             self.next_available_key_ind = None
-        logging.info(f'get key {to_return[-5:]} next avai {self.next_available_key_ind}')
+        logging.info(f'get key idx {self.key2ind[to_return]} next avai {self.next_available_key_ind}')
         return to_return
 
     def return_key(self, key, time_spent: float = None, forbid: bool = False):
@@ -76,7 +76,7 @@ class KeyManager:
     def get_report(self):
         report: List[str] = []
         for key in self.keys:
-            report.append(f'{key}\t{len(self.key2times[key])}\t{np.mean(self.key2times[key])}\t{key in self.forbid_keys}')
+            report.append(f'key#{self.key2ind[key]}\t{len(self.key2times[key])}\t{np.mean(self.key2times[key])}\t{key in self.forbid_keys}')
         return '\n'.join(report)
 
 
@@ -285,12 +285,15 @@ class QueryAgent:
                 frequency_penalty=self.frequency_penalty,
                 **params)
 
-            generations = [ApiReturn(
-                prompt=q,
-                text=(prefixes[0][0] + process_chatgpt(r.get('message', {}).get('content', ''))) if echo else process_chatgpt(r.get('message', {}).get('content', '')),  # TODO: corner case where space does not work?
-                finish_reason='length' if echo else r.get('finish_reason'),  # never stop in echo mode
-                model=responses.get('model', self.model),
-                skip_len=0) for r, (q, _, _) in zip(responses['choices'], prompts)]
+            generations = []
+            for r, (q, _, _) in zip(responses['choices'], prompts):
+                chat_content = process_chatgpt(r.get('message', {}).get('content', ''))
+                generations.append(ApiReturn(
+                    prompt=q,
+                    text=(prefixes[0][0] + chat_content) if echo else chat_content,  # TODO: corner case where space does not work?
+                    finish_reason='length' if echo else r.get('finish_reason'),  # never stop in echo mode
+                    model=responses.get('model', self.model),
+                    skip_len=0))
         else:
             responses = openai_api_call(
                 api_key=api_key,
