@@ -77,10 +77,9 @@ def retry_with_exponential_backoff(
 
                 # query API
                 start_t = time.time()
-                api_key_suffix = str(_kwargs.get("api_key", ""))[-5:] if _kwargs.get("api_key") else ""
-                logging.info(f'API call start: {api_key_suffix}')
+                logging.info('API call start')
                 results = func(*args, **_kwargs)
-                logging.info(f'API call end: {api_key_suffix}')
+                logging.info('API call end')
                 return results
 
             # retry on specific errors
@@ -213,7 +212,7 @@ def openai_api_call(*args, **kwargs):
         if len(request_kwargs['messages']) <= 0:
             return []
         messages = request_kwargs.pop('messages')
-        if type(messages[0]) is list:  # batch request
+        if isinstance(messages[0], list):  # batch request
             return asyncio.run(async_chatgpt(messages=messages, model=resolved_model, **request_kwargs))
         else:
             return _ollama_chat_completion(messages, resolved_model, **request_kwargs)

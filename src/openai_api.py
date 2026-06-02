@@ -16,7 +16,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 from .retriever import BM25
 from .templates import CtxPrompt, ApiReturn, RetrievalInstruction
 from .datasets import StrategyQA, WikiMultiHopQA, WikiAsp, ASQA
-from .utils import Utils, NoKeyAvailable, openai_api_call
+from .utils import Utils, NoKeyAvailable, openai_api_call, OLLAMA_MODEL
 logging.basicConfig(level=logging.INFO)
 
 
@@ -628,7 +628,7 @@ def write_worker(output_file: str, output_queue: Queue, size: int = None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='strategyqa', choices=['strategyqa', '2wikihop', 'wikiasp', 'asqa'])
-    parser.add_argument('--model', type=str, default=os.getenv('OLLAMA_MODEL', 'llama3'))
+    parser.add_argument('--model', type=str, default=OLLAMA_MODEL)
     parser.add_argument('--input', type=str, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--index_name', type=str, default='test')
