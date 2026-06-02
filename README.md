@@ -42,18 +42,19 @@ This is only required for experiments on the WikiASP dataset.
 1. Create a bing search API key following instructions on [https://www.microsoft.com/en-us/bing/apis/bing-web-search-api](https://www.microsoft.com/en-us/bing/apis/bing-web-search-api).
 2. Run a local bing search server with caching functionality to save credits: `export BING_SEARCH_KEY=$YOUR_KEY; python bing_search_cache_server.py &> bing_log.out &`.
 
-### Setup OpenAI keys
-Put OpenAI keys in the `keys.sh` file.
-Multiple keys can be used to accelerate experiments.
-Please avoid uploading your keys to Github by accident!
+### Setup Ollama
+Install and run Ollama locally, then pull a model (for example, `ollama pull llama3`).
+Set `OLLAMA_MODEL` to the local model name if you want something other than the default.
+If your Ollama server is not on the default `http://localhost:11434`, set `OLLAMA_BASE_URL`.
+No API keys are required.
 
 ### Run FLARE
-Use the following command to run FLARE with `text-davinci-003`. 
+Use the following command to run FLARE with your local Ollama model.
 ```shell
 ./openai.sh 2wikihop configs/2wikihop_flare_config.json  # 2WikiMultihopQA dataset
 ./openai.sh wikiasp configs/wikiasp_flare_config.json  # WikiAsp dataset
 ```
-Be careful, experiments are relatively expensive because FLARE calls OpenAI API multiple times for a single example. You can decrease `max_num_examples` to run small-scale experiments to save credits.
+Be careful, experiments can be resource-intensive because FLARE calls the model multiple times for a single example. You can decrease `max_num_examples` to run small-scale experiments to save resources.
 Set `debug=true` to active the debugging mode which walks you through the iterative retrieval and generation process one example at a time.
 
 ## Citation
