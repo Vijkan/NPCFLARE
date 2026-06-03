@@ -3,27 +3,77 @@ import logging
 import os
 import json
 import re
+import csv
 import glob
 import string
-from collections import Counter
+from collections import Counter, namedtuple
 from urllib.parse import unquote
 from tqdm import tqdm
 import numpy as np
-import spacy
+from transformers import pipeline
 from datasets import Dataset, concatenate_datasets, load_from_disk
-from beir.datasets.data_loader import GenericDataLoader
 logging.basicConfig(level=logging.INFO)
+
+# Simple named entity representation
+Entity = namedtuple('Entity', ['text'])
+
+
+def _load_beir_data(data_folder: str):
+    """Load BEIR-format data (corpus, queries, qrels) from a folder."""
+    corpus = {}
+    queries = {}
+    qrels = {}
+
+    corpus_file = os.path.join(data_folder, 'corpus.jsonl')
+    if os.path.exists(corpus_file):
+        with open(corpus_file, 'r') as f:
+            for line in f:
+                obj = json.loads(line)
+                corpus[obj['_id']] = {'text': obj.get('text', ''), 'title': obj.get('title', '')}
+
+    queries_file = os.path.join(data_folder, 'queries.jsonl')
+    if os.path.exists(queries_file):
+        with open(queries_file, 'r') as f:
+            for line in f:
+                obj = json.loads(line)
+                queries[obj['_id']] = obj.get('text', '')
+
+    for split in ['dev', 'test', 'train']:
+        qrels_file = os.path.join(data_folder, 'qrels', f'{split}.tsv')
+        if os.path.exists(qrels_file):
+            with open(qrels_file, 'r') as f:
+                reader = csv.reader(f, delimiter='\t')
+                next(reader)  # skip header
+                for row in reader:
+                    qid, did, score = row[0], row[1], int(row[2])
+                    if qid not in qrels:
+                        qrels[qid] = {}
+                    qrels[qid][did] = score
+            break
+
+    return corpus, queries, qrels
 
 
 class BaseDataset:
-    spacy_nlp = spacy.load('en_core_web_sm')
-    use_model = 'spacy'
-    nlp = eval(f'{use_model}_nlp')
+    _ner_pipeline = None
+
+    @classmethod
+    def _get_ner_pipeline(cls):
+        if cls._ner_pipeline is None:
+            cls._ner_pipeline = pipeline(
+                'ner',
+                model='dslim/bert-base-NER',
+                aggregation_strategy='simple'
+            )
+        return cls._ner_pipeline
 
     @classmethod
     def get_ner(cls, text):
-        doc = cls.nlp(text)
-        return list(doc.ents)
+        ner = cls._get_ner_pipeline()
+        results = ner(text)
+        # Group sub-word tokens into entities
+        entities = [Entity(text=r['word'].strip()) for r in results if r['word'].strip()]
+        return entities
 
     @classmethod
     def entity_f1_score(
@@ -255,7 +305,7 @@ class StrategyQA(BaseDataset):
 
     def load_data(self, beir_dir: str):
         query_file = os.path.join(beir_dir, 'queries.jsonl')
-        corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split='dev')
+        corpus, queries, qrels = _load_beir_data(beir_dir)
         dataset = []
         with open(query_file, 'r') as fin:
             for l in fin:

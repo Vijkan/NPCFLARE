@@ -5,9 +5,11 @@ import os
 import logging
 import copy
 import string
-import asyncio
-import openai
+import requests
 logging.basicConfig(level=logging.INFO)
+
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen3:8b')
+OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
 
 
 class Utils:
@@ -15,7 +17,8 @@ class Utils:
 
     @classmethod
     def is_chat(cls, model: str):
-        return 'turbo' in model
+        # All Ollama models use chat interface
+        return True
 
     @classmethod
     def is_code(cls, model: str):
@@ -23,7 +26,8 @@ class Utils:
 
     @classmethod
     def no_stop(cls, model: str):
-        return 'turbo' in model
+        # Ollama models use chat interface
+        return True
 
 
 class NoKeyAvailable(Exception):
@@ -37,106 +41,149 @@ def retry_with_exponential_backoff(
     exponential_base: float = 2,
     jitter: bool = True,
     max_retries: int = 5,
-    errors_to_catch: tuple = (openai.error.RateLimitError, openai.error.ServiceUnavailableError, openai.error.APIError, openai.error.Timeout, NoKeyAvailable),
-    errors_to_raise: tuple = (openai.error.APIConnectionError, openai.error.InvalidRequestError, openai.error.AuthenticationError),
+    errors_to_catch: tuple = (requests.exceptions.ConnectionError, requests.exceptions.Timeout, NoKeyAvailable),
+    errors_to_raise: tuple = (),
 ):
     """Retry a function with exponential backoff."""
     def wrapper(*args, **kwargs):
-        # initialize variables
-        is_code_model = Utils.is_chat(kwargs['model'])
-        mrpm = max_reqs_per_min
-        mrpm = mrpm or (15 if is_code_model else 1000)
-        const_delay = 60 / mrpm
         delay = initial_delay
         num_retries = 0
 
-        # loop until a successful response or max_retries is hit or an exception is raised
         while True:
-            # initialize key-related variables
-            api_key = get_key_func = return_key_func = None
-            forbid_key = False
-
             try:
-                # get key
-                _kwargs = copy.deepcopy(kwargs)
-                if 'api_key' in kwargs:
-                    ori_api_key = kwargs['api_key']
-                    if type(ori_api_key) is tuple:  # get a key through a call
-                        get_key_func, return_key_func = ori_api_key
-                        api_key = get_key_func()
-                    else:  # a specified key
-                        api_key = ori_api_key or os.getenv('OPENAI_API_KEY')
-                    _kwargs['api_key'] = api_key
-
-                # query API
                 start_t = time.time()
-                logging.info(f'API call start: {_kwargs.get("api_key", "")[-5:]}')
-                results = func(*args, **_kwargs)
-                logging.info(f'API call end: {_kwargs.get("api_key", "")[-5:]}')
+                logging.info('Ollama API call start')
+                results = func(*args, **kwargs)
+                logging.info('Ollama API call end')
                 return results
 
-            # retry on specific errors
             except errors_to_catch as e:
-                # check if the key is useless
-                if hasattr(e, 'json_body') and e.json_body is not None and 'error' in e.json_body and 'type' in e.json_body['error'] and e.json_body['error']['type'] == 'insufficient_quota':  # quota error
-                    logging.info(f'NO QUOTA: {api_key[-5:]}')
-                    forbid_key = True
-                if hasattr(e, 'json_body') and e.json_body is not None and 'error' in e.json_body and 'type' in e.json_body['error'] and e.json_body['error']['code'] == 'account_deactivated':  # ban error
-                    logging.info(f'BAN: {api_key[-5:]}')
-                    forbid_key = True
-
-                # check num of retries
                 num_retries += 1
                 if num_retries > max_retries:
                     raise Exception(f'maximum number of retries ({max_retries}) exceeded.')
-
-                # incremental delay
                 delay *= exponential_base * (1 + jitter * random.random())
-                logging.info(f'retry on {e}, sleep for {const_delay + delay}')
-                time.sleep(const_delay + delay)
+                logging.info(f'retry on {e}, sleep for {delay}')
+                time.sleep(delay)
 
-            # raise on specific errors
-            except errors_to_raise as e:
-                raise e
-
-            # raise exceptions for any errors not specified
             except Exception as e:
                 raise e
-
-            finally:  # return key if necessary
-                if api_key is not None and return_key_func is not None:
-                    end_t = time.time()
-                    return_key_func(api_key, time_spent=end_t - start_t, forbid=forbid_key)
 
     return wrapper
 
 
-async def async_chatgpt(
-    *args,
-    messages: List[List[Dict[str, Any]]],
-    **kwargs,
-) -> List[str]:
-    async_responses = [
-        openai.ChatCompletion.acreate(
-            *args,
-            messages=x,
-            **kwargs,
-        )
-        for x in messages
-    ]
-    return await asyncio.gather(*async_responses)
+def _ollama_chat(messages, model=None, temperature=0.0, max_tokens=2048, stop=None, **kwargs):
+    """Call Ollama chat API."""
+    model = model or OLLAMA_MODEL
+    url = f'{OLLAMA_BASE_URL}/api/chat'
+
+    options = {
+        'temperature': temperature,
+        'num_predict': max_tokens,
+    }
+    if stop:
+        if isinstance(stop, str):
+            stop = [stop]
+        options['stop'] = stop
+
+    payload = {
+        'model': model,
+        'messages': messages,
+        'stream': False,
+        'options': options,
+    }
+
+    response = requests.post(url, json=payload, timeout=120)
+    response.raise_for_status()
+    result = response.json()
+
+    # Return in a format compatible with the rest of the codebase
+    return {
+        'choices': [{
+            'message': {'content': result['message']['content']},
+            'finish_reason': 'stop' if result.get('done', True) else 'length',
+        }],
+        'model': model,
+    }
+
+
+def _ollama_generate(prompt, model=None, temperature=0.0, max_tokens=2048, stop=None, **kwargs):
+    """Call Ollama generate API for completion-style requests."""
+    model = model or OLLAMA_MODEL
+    url = f'{OLLAMA_BASE_URL}/api/generate'
+
+    options = {
+        'temperature': temperature,
+        'num_predict': max_tokens,
+    }
+    if stop:
+        if isinstance(stop, str):
+            stop = [stop]
+        options['stop'] = stop
+
+    payload = {
+        'model': model,
+        'prompt': prompt,
+        'stream': False,
+        'options': options,
+    }
+
+    response = requests.post(url, json=payload, timeout=120)
+    response.raise_for_status()
+    result = response.json()
+
+    text = result.get('response', '')
+    return {
+        'choices': [{
+            'text': text,
+            'logprobs': {'tokens': [], 'token_logprobs': [], 'text_offset': []},
+            'finish_reason': 'stop' if result.get('done', True) else 'length',
+        }],
+        'model': model,
+    }
 
 
 @retry_with_exponential_backoff
 def openai_api_call(*args, **kwargs):
-    model = kwargs['model']
-    is_chat_model = Utils.is_chat(model)
-    if is_chat_model:
-        if len(kwargs['messages']) <= 0:
+    """Unified API call that routes to Ollama."""
+    # Remove keys not needed for Ollama
+    kwargs.pop('api_key', None)
+    kwargs.pop('logit_bias', None)
+    kwargs.pop('frequency_penalty', None)
+    kwargs.pop('top_p', None)
+    kwargs.pop('logprobs', None)
+    kwargs.pop('echo', None)
+
+    model = kwargs.pop('model', OLLAMA_MODEL)
+    temperature = kwargs.pop('temperature', 0.0)
+    max_tokens = kwargs.pop('max_tokens', 2048)
+    stop = kwargs.pop('stop', None)
+
+    if 'messages' in kwargs:
+        messages = kwargs.pop('messages')
+        if len(messages) <= 0:
             return []
-        if type(kwargs['messages'][0]) is list:  # batch request
-            return asyncio.run(async_chatgpt(*args, **kwargs))
+        if isinstance(messages[0], list):  # batch request
+            results = []
+            for msg_list in messages:
+                result = _ollama_chat(
+                    msg_list, model=model, temperature=temperature,
+                    max_tokens=max_tokens, stop=stop)
+                results.append(result)
+            return results
         else:
-            return openai.ChatCompletion.create(*args, **kwargs)
+            return _ollama_chat(
+                messages, model=model, temperature=temperature,
+                max_tokens=max_tokens, stop=stop)
+    elif 'prompt' in kwargs:
+        prompts = kwargs.pop('prompt')
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        all_choices = []
+        for prompt in prompts:
+            result = _ollama_generate(
+                prompt, model=model, temperature=temperature,
+                max_tokens=max_tokens, stop=stop)
+            all_choices.extend(result['choices'])
+        return {'choices': all_choices, 'model': model}
     else:
-        return openai.Completion.create(*args, **kwargs)
+        raise ValueError('Either "messages" or "prompt" must be provided')

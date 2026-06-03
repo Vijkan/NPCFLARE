@@ -11,12 +11,12 @@ from operator import itemgetter
 from collections import defaultdict, Counter
 from multiprocessing import Process, Queue, Lock
 from multiprocessing.managers import BaseManager
-from transformers import GPT2TokenizerFast
+from transformers import AutoTokenizer
 from tenacity import retry, stop_after_attempt, wait_fixed
 from .retriever import BM25
 from .templates import CtxPrompt, ApiReturn, RetrievalInstruction
 from .datasets import StrategyQA, WikiMultiHopQA, WikiAsp, ASQA
-from .utils import Utils, NoKeyAvailable, openai_api_call
+from .utils import Utils, NoKeyAvailable, openai_api_call, OLLAMA_MODEL
 logging.basicConfig(level=logging.INFO)
 
 
@@ -618,16 +618,16 @@ def write_worker(output_file: str, output_queue: Queue, size: int = None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='strategyqa', choices=['strategyqa', '2wikihop', 'wikiasp', 'asqa'])
-    parser.add_argument('--model', type=str, default='text-davinci-003', choices=['code-davinci-002', 'text-davinci-002', 'text-davinci-003', 'gpt-3.5-turbo-0301'])
+    parser.add_argument('--model', type=str, default=None, help='Ollama model name (defaults to OLLAMA_MODEL env var)')
     parser.add_argument('--input', type=str, default=None)
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--index_name', type=str, default='test')
     parser.add_argument('--shard_id', type=int, default=0)
     parser.add_argument('--num_shards', type=int, default=1)
-    parser.add_argument('--openai_keys', type=str, default=[], help='openai keys', nargs='+')
     parser.add_argument('--config_file', type=str, default=None, help='config file')
     parser.add_argument('--config_kvs', type=str, default=None, help='extra config json, used to override config_file')
-    parser.add_argument('--search_engine', type=str, default='elasticsearch', choices=['bing', 'elasticsearch'])
+    parser.add_argument('--search_engine', type=str, default='faiss', choices=['faiss', 'chromadb'])
+    parser.add_argument('--embedding_model', type=str, default='all-MiniLM-L6-v2', help='sentence-transformers model for embeddings')
     parser.add_argument('--prompt_type', type=str, default=None, help='used to override config_file')
 
     parser.add_argument('--batch_size', type=int, default=8)
@@ -640,12 +640,14 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=2022)
     parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
-    args.multiprocess = len(args.openai_keys) > 1
+    if args.model is None:
+        args.model = OLLAMA_MODEL
+    args.multiprocess = False
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     # init tokenizer for truncation
-    prompt_tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
+    prompt_tokenizer = AutoTokenizer.from_pretrained('gpt2')
     prompt_tokenizer.pad_token = prompt_tokenizer.eos_token
 
     # default args
@@ -698,10 +700,10 @@ if __name__ == '__main__':
         tokenizer=prompt_tokenizer,
         index_name=args.index_name,
         engine=args.search_engine,
-        exclude_domains=['wikipedia.org', 'wikiwand.com', 'wiki2.org', 'wikimedia.org'])
+        embedding_model=args.embedding_model)
     retrieval_kwargs['retriever'] = retriever
     retrieval_kwargs['debug'] = args.debug
-    retrieval_kwargs['final_stop_sym'] = args.final_stop_sym or ('!@#$%^&*()\n\n)(*&^%$#@!' if Utils.no_stop(model=args.model) else '\n\n')
+    retrieval_kwargs['final_stop_sym'] = args.final_stop_sym or '!@#$%^&*()\n\n)(*&^%$#@!'
 
     logging.info('=== retrieval kwargs ===')
     logging.info(retrieval_kwargs)
@@ -742,25 +744,6 @@ if __name__ == '__main__':
     CtxPrompt.add_ref_suffix = retrieval_kwargs['add_ref_suffix']
     CtxPrompt.add_ref_prefix = retrieval_kwargs['add_ref_prefix']
 
-    # multiprocess
-    if args.multiprocess:  # start query processes
-        lock = Lock()
-        CustomManager.register('KeyManager', KeyManager)
-        manager = CustomManager()
-        manager.start()
-        key_manager = manager.KeyManager(args.openai_keys)
-        logging.info(f'#keys {len(key_manager._getvalue())}')
-        input_queue = Queue()
-        output_queue = Queue()
-        processes = []
-        for _ in range(len(key_manager._getvalue())):
-            p = Process(target=query_agent_worker, args=(qagent, key_manager, lock, input_queue, output_queue))
-            p.daemon = True
-            p.start()
-            processes.append(p)
-    else:
-        key_manager = KeyManager(args.openai_keys)
-
     # downsample
     data = data.dataset
     if args.max_num_examples and args.max_num_examples < len(data):
@@ -778,43 +761,18 @@ if __name__ == '__main__':
     if os.path.dirname(args.output):
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    if not args.multiprocess:  # query for one process
-        key = key_manager.get_key()
-        with tqdm(total=len(data)) as pbar, open(args.output, 'w') as fout:
-            for b in range(0, len(data), args.batch_size):
-                batch = data.select(range(b, min(b + args.batch_size, len(data))))
-                prompts = [CtxPrompt.from_dict(example) for example in batch]
-                generations, probs, retrievals, traces = qagent.prompt(prompts, api_key=key)
-                retrievals = retrievals or [None] * len(generations)
-                traces = traces or [None] * len(generations)
-                for example, generation, prob, retrieval, trace in zip(batch, generations, probs, retrievals, traces):
-                    example['output'] = generation
-                    example['output_prob'] = prob
-                    example['retrieval'] = retrieval
-                    example['trace'] = trace
-                    fout.write(json.dumps(example) + '\n')
-                pbar.update(len(batch))
-        key_manager.return_key(key)
-    else:  # query for multi-process
-        # start write process
-        write_p = Process(target=write_worker, args=(args.output, output_queue, len(data)))
-        write_p.daemon = True
-        write_p.start()
-
-        # feed data
+    # query (single process with Ollama)
+    with tqdm(total=len(data)) as pbar, open(args.output, 'w') as fout:
         for b in range(0, len(data), args.batch_size):
             batch = data.select(range(b, min(b + args.batch_size, len(data))))
-            input_queue.put(batch)
-
-        # feed finish token
-        for _ in processes:
-            input_queue.put('DONE')
-        for p in processes:
-            p.join()
-        output_queue.put('DONE')
-        write_p.join()
-
-        # report key performance
-        logging.info('keys performance')
-        logging.info(key_manager._getvalue().get_report())
-        manager.shutdown()
+            prompts = [CtxPrompt.from_dict(example) for example in batch]
+            generations, probs, retrievals, traces = qagent.prompt(prompts, api_key=None)
+            retrievals = retrievals or [None] * len(generations)
+            traces = traces or [None] * len(generations)
+            for example, generation, prob, retrieval, trace in zip(batch, generations, probs, retrievals, traces):
+                example['output'] = generation
+                example['output_prob'] = prob
+                example['retrieval'] = retrieval
+                example['trace'] = trace
+                fout.write(json.dumps(example) + '\n')
+            pbar.update(len(batch))

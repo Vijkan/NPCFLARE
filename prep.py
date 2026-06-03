@@ -5,15 +5,53 @@ import json
 import time
 import glob
 import csv
+import os
 import evaluate
 import re
 import logging
 from tqdm import tqdm
 import numpy as np
 import torch
-from beir.datasets.data_loader import GenericDataLoader
 from src.datasets import WikiMultiHopQA, WikiAsp, ASQA
 from src.utils import Utils
+
+
+def _load_beir_data(data_folder: str):
+    """Load BEIR-format data (corpus, queries, qrels) from a folder."""
+    import os
+    corpus = {}
+    queries = {}
+    qrels = {}
+
+    corpus_file = os.path.join(data_folder, 'corpus.jsonl')
+    if os.path.exists(corpus_file):
+        with open(corpus_file, 'r') as f:
+            for line in f:
+                obj = json.loads(line)
+                corpus[obj['_id']] = {'text': obj.get('text', ''), 'title': obj.get('title', '')}
+
+    queries_file = os.path.join(data_folder, 'queries.jsonl')
+    if os.path.exists(queries_file):
+        with open(queries_file, 'r') as f:
+            for line in f:
+                obj = json.loads(line)
+                queries[obj['_id']] = obj.get('text', '')
+
+    # Try TSV format for qrels
+    for split in ['dev', 'test', 'train']:
+        qrels_file = os.path.join(data_folder, 'qrels', f'{split}.tsv')
+        if os.path.exists(qrels_file):
+            with open(qrels_file, 'r') as f:
+                reader = csv.reader(f, delimiter='\t')
+                next(reader)  # skip header
+                for row in reader:
+                    qid, did, score = row[0], row[1], int(row[2])
+                    if qid not in qrels:
+                        qrels[qid] = {}
+                    qrels[qid][did] = score
+            break
+
+    return corpus, queries, qrels
 
 
 def eval(
@@ -33,7 +71,7 @@ def eval(
         anchor_text = []
     anchor_text = anchor_text if type(anchor_text) is list else [anchor_text]
     if beir_dir is not None:
-        corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split='dev')
+        corpus, queries, qrels = _load_beir_data(beir_dir)
     else:
         corpus = queries = qrels = None
 
@@ -272,53 +310,43 @@ def eval(
         print('')
 
 
-def build_elasticsearch(
+def build_index(
     beir_corpus_file_pattern: str,
     index_name: str,
+    embedding_model: str = 'all-MiniLM-L6-v2',
+    engine: str = 'faiss',
 ):
+    """Build a local FAISS or ChromaDB index from BEIR-format corpus files."""
+    from src.retriever import BM25
     beir_corpus_files = glob.glob(beir_corpus_file_pattern)
     print(f'#files {len(beir_corpus_files)}')
-    from beir.retrieval.search.lexical.elastic_search import ElasticSearch
-    config = {
-        'hostname': 'localhost',
-        'index_name': index_name,
-        'keys': {'title': 'title', 'body': 'txt'},
-        'timeout': 100,
-        'retry_on_timeout': True,
-        'maxsize': 24,
-        'number_of_shards': 'default',
-        'language': 'english',
-    }
-    es = ElasticSearch(config)
 
-    # create index
-    print(f'create index {index_name}')
-    es.delete_index()
-    time.sleep(5)
-    es.create_index()
+    retriever = BM25(
+        index_name=index_name,
+        engine=engine,
+        embedding_model=embedding_model,
+    )
 
-    # generator
-    def generate_actions():
-        for beir_corpus_file in beir_corpus_files:
-            with open(beir_corpus_file, 'r') as fin:
-                reader = csv.reader(fin, delimiter='\t')
-                header = next(reader)  # skip header
-                for row in reader:
-                    _id, text, title = row[0], row[1], row[2]
-                    es_doc = {
-                        '_id': _id,
-                        '_op_type': 'index',
-                        'refresh': 'wait_for',
-                        config['keys']['title']: title,
-                        config['keys']['body']: text,
-                    }
-                    yield es_doc
+    # collect documents
+    doc_ids = []
+    documents = []
+    for beir_corpus_file in beir_corpus_files:
+        with open(beir_corpus_file, 'r') as fin:
+            reader = csv.reader(fin, delimiter='\t')
+            next(reader)  # skip header
+            for row in reader:
+                _id, text, title = row[0], row[1], row[2]
+                doc_ids.append(_id)
+                documents.append(f'{title} {text}' if title else text)
 
-    # index
-    progress = tqdm(unit='docs')
-    es.bulk_add_to_index(
-        generate_actions=generate_actions(),
-        progress=progress)
+    # index in batches
+    batch_size = 512
+    for i in tqdm(range(0, len(documents), batch_size), desc='indexing'):
+        batch_ids = doc_ids[i:i + batch_size]
+        batch_docs = documents[i:i + batch_size]
+        retriever.add_documents(batch_ids, batch_docs)
+
+    print(f'Indexed {len(documents)} documents into {engine} index "{index_name}"')
 
 
 def jsonl_to_keyvalue(
@@ -347,14 +375,18 @@ def jsonl_to_keyvalue(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, required=True, help='task to perform', choices=[
-        'eval', 'build_elasticsearch', 'jsonl_to_keyvalue'])
+        'eval', 'build_index', 'jsonl_to_keyvalue'])
     parser.add_argument('--inp', type=str, default=None, nargs='+', help='input file')
     parser.add_argument('--dataset', type=str, default='2wikihop', help='input dataset', choices=[
         'strategyqa', '2wikihop', 'wikiasp', 'asqa'])
-    parser.add_argument('--model', type=str, default='gpt-3.5-turbo-0301', help='model name', choices=[
-        'code-davinci-002', 'gpt-3.5-turbo-0301'])
+    parser.add_argument('--model', type=str, default=None, help='model name (defaults to OLLAMA_MODEL env var)')
     parser.add_argument('--out', type=str, default=None, help='output file')
+    parser.add_argument('--embedding_model', type=str, default='all-MiniLM-L6-v2', help='sentence-transformers model')
+    parser.add_argument('--engine', type=str, default='faiss', choices=['faiss', 'chromadb'])
     args = parser.parse_args()
+
+    if args.model is None:
+        args.model = os.environ.get('OLLAMA_MODEL', 'qwen3:8b')
 
     # set random seed to make sure the same examples are sampled across multiple runs
     random.seed(2022)
@@ -390,9 +422,10 @@ if __name__ == '__main__':
                     'The answer to this interpretation is (.*)$'],
                 beir_dir=None)
 
-    elif args.task == 'build_elasticsearch':
-        beir_corpus_file_pattern, index_name = args.inp  # 'wikipedia_dpr'
-        build_elasticsearch(beir_corpus_file_pattern, index_name=index_name)
+    elif args.task == 'build_index':
+        beir_corpus_file_pattern, index_name = args.inp
+        build_index(beir_corpus_file_pattern, index_name=index_name,
+                   embedding_model=args.embedding_model, engine=args.engine)
 
     elif args.task == 'jsonl_to_keyvalue':
         jsonl_file = args.inp[0]

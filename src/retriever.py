@@ -1,48 +1,154 @@
 from typing import List, Dict, Tuple
-import time
-import tqdm
+import os
 import uuid
+import logging
 import numpy as np
-import torch
 from transformers import AutoTokenizer
-from beir.datasets.data_loader import GenericDataLoader
-from beir.retrieval.evaluation import EvaluateRetrieval
-from beir.retrieval.search.lexical import BM25Search
-from beir.retrieval.search.lexical.elastic_search import ElasticSearch
-from .bing import search_bing_batch
+
+logging.basicConfig(level=logging.INFO)
 
 
 def get_random_doc_id():
     return f'_{uuid.uuid4()}'
 
 
-class SearchEngineConnector:
+class LocalEmbeddingRetriever:
+    """Local retrieval using FAISS and sentence-transformers embeddings."""
+
     def __init__(
         self,
-        engine: str,
-        only_domain: str = None,
-        exclude_domains: List[str] = [],
+        embedding_model: str = 'all-MiniLM-L6-v2',
+        collection_name: str = 'default',
     ):
-        assert engine in {'bing'}
-        self.engine = engine
-        self.only_domain = only_domain
-        self.exclude_domains = exclude_domains
+        from sentence_transformers import SentenceTransformer
+        import faiss
+
+        self.model = SentenceTransformer(embedding_model)
+        self.dimension = self.model.get_sentence_embedding_dimension()
+        self.index = faiss.IndexFlatIP(self.dimension)  # Inner product (cosine after normalization)
+        self.documents: List[str] = []
+        self.doc_ids: List[str] = []
+        self.collection_name = collection_name
+
+    def add_documents(self, doc_ids: List[str], documents: List[str]):
+        """Add documents to the FAISS index."""
+        if not documents:
+            return
+        embeddings = self.model.encode(documents, normalize_embeddings=True)
+        self.index.add(np.array(embeddings, dtype=np.float32))
+        self.documents.extend(documents)
+        self.doc_ids.extend(doc_ids)
+
+    def search(self, queries: List[str], topk: int = 5) -> List[List[Tuple[str, float, str]]]:
+        """Search for similar documents."""
+        if self.index.ntotal == 0:
+            return [[] for _ in queries]
+        query_embeddings = self.model.encode(queries, normalize_embeddings=True)
+        scores, indices = self.index.search(
+            np.array(query_embeddings, dtype=np.float32),
+            min(topk, self.index.ntotal)
+        )
+        results = []
+        for i in range(len(queries)):
+            query_results = []
+            for j in range(len(indices[i])):
+                idx = indices[i][j]
+                if idx == -1:
+                    continue
+                query_results.append((self.doc_ids[idx], scores[i][j], self.documents[idx]))
+            results.append(query_results)
+        return results
 
     def retrieve(
         self,
-        corpus = None,
+        corpus=None,
         queries: Dict[int, str] = None,
         **kwargs,
     ):
         qs = list(queries.values())
-        if self.engine == 'bing':
-            all_results = search_bing_batch(
-                qs, only_domain=self.only_domain, exclude_domains=self.exclude_domains)
-        else:
-            raise NotImplementedError
+        query_texts = [q[0] if isinstance(q, tuple) else q for q in qs]
+        topk = kwargs.get('top_k', 10)
+        search_results = self.search(query_texts, topk=topk)
+
         qid2results: Dict[int, Dict[str, Tuple[float, str]]] = {}
-        for (qid, query), results in zip(queries.items(), all_results):
-            qid2results[qid] = {str(r['url']) + get_random_doc_id(): (0, r['snippet']) for r in results}
+        for (qid, query), results in zip(queries.items(), search_results):
+            qid2results[qid] = {
+                doc_id + get_random_doc_id(): (score, text)
+                for doc_id, score, text in results
+            }
+        return qid2results
+
+
+class ChromaRetriever:
+    """Local retrieval using ChromaDB with sentence-transformers embeddings."""
+
+    def __init__(
+        self,
+        embedding_model: str = 'all-MiniLM-L6-v2',
+        collection_name: str = 'default',
+        persist_directory: str = None,
+    ):
+        import chromadb
+        from chromadb.config import Settings
+
+        if persist_directory:
+            self.client = chromadb.PersistentClient(path=persist_directory)
+        else:
+            self.client = chromadb.Client()
+
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        self.embedding_model_name = embedding_model
+
+    def add_documents(self, doc_ids: List[str], documents: List[str]):
+        """Add documents to the ChromaDB collection."""
+        if not documents:
+            return
+        self.collection.add(
+            ids=doc_ids,
+            documents=documents,
+        )
+
+    def search(self, queries: List[str], topk: int = 5) -> List[List[Tuple[str, float, str]]]:
+        """Search for similar documents."""
+        if self.collection.count() == 0:
+            return [[] for _ in queries]
+        results = self.collection.query(
+            query_texts=queries,
+            n_results=min(topk, self.collection.count()),
+        )
+        output = []
+        for i in range(len(queries)):
+            query_results = []
+            if results['ids'] and results['ids'][i]:
+                for j in range(len(results['ids'][i])):
+                    doc_id = results['ids'][i][j]
+                    distance = results['distances'][i][j] if results.get('distances') else 0.0
+                    score = 1.0 - distance  # Convert distance to similarity
+                    doc_text = results['documents'][i][j] if results.get('documents') else ''
+                    query_results.append((doc_id, score, doc_text))
+            output.append(query_results)
+        return output
+
+    def retrieve(
+        self,
+        corpus=None,
+        queries: Dict[int, str] = None,
+        **kwargs,
+    ):
+        qs = list(queries.values())
+        query_texts = [q[0] if isinstance(q, tuple) else q for q in qs]
+        topk = kwargs.get('top_k', 10)
+        search_results = self.search(query_texts, topk=topk)
+
+        qid2results: Dict[int, Dict[str, Tuple[float, str]]] = {}
+        for (qid, query), results in zip(queries.items(), search_results):
+            qid2results[qid] = {
+                doc_id + get_random_doc_id(): (score, text)
+                for doc_id, score, text in results
+            }
         return qid2results
 
 
@@ -51,20 +157,30 @@ class BM25:
         self,
         tokenizer: AutoTokenizer = None,
         index_name: str = None,
-        engine: str = 'elasticsearch',
-        **search_engine_kwargs,
+        engine: str = 'faiss',
+        embedding_model: str = 'all-MiniLM-L6-v2',
+        persist_directory: str = None,
+        **kwargs,
     ):
         self.tokenizer = tokenizer
-        # load index
-        assert engine in {'elasticsearch', 'bing'}
-        if engine == 'elasticsearch':
+        assert engine in {'faiss', 'chromadb'}
+        if engine == 'faiss':
             self.max_ret_topk = 1000
-            self.retriever = EvaluateRetrieval(
-                BM25Search(index_name=index_name, hostname='localhost', initialize=False, number_of_shards=1),
-                k_values=[self.max_ret_topk])
-        else:
-            self.max_ret_topk = 50
-            self.retriever = SearchEngineConnector(engine, **search_engine_kwargs)
+            self.retriever = LocalEmbeddingRetriever(
+                embedding_model=embedding_model,
+                collection_name=index_name or 'default',
+            )
+        else:  # chromadb
+            self.max_ret_topk = 1000
+            self.retriever = ChromaRetriever(
+                embedding_model=embedding_model,
+                collection_name=index_name or 'default',
+                persist_directory=persist_directory,
+            )
+
+    def add_documents(self, doc_ids: List[str], documents: List[str]):
+        """Add documents to the retriever index."""
+        self.retriever.add_documents(doc_ids, documents)
 
     def retrieve(
         self,
@@ -74,14 +190,12 @@ class BM25:
         max_query_length: int = None,
     ):
         assert topk <= self.max_ret_topk
-        device = None
         bs = len(queries)
 
         # truncate queries
-        if max_query_length:
+        if max_query_length and self.tokenizer:
             ori_ps = self.tokenizer.padding_side
             ori_ts = self.tokenizer.truncation_side
-            # truncate/pad on the left side
             self.tokenizer.padding_side = 'left'
             self.tokenizer.truncation_side = 'left'
             tokenized = self.tokenizer(
@@ -98,7 +212,8 @@ class BM25:
         # retrieve
         filter_ids = filter_ids or ([None] * len(queries))
         results: Dict[str, Dict[str, Tuple[float, str]]] = self.retriever.retrieve(
-            None, dict(zip(range(len(queries)), list(zip(queries, filter_ids)))), disable_tqdm=True)
+            None, dict(zip(range(len(queries)), list(zip(queries, filter_ids)))),
+            top_k=topk)
 
         # prepare outputs
         docids: List[str] = []
@@ -121,128 +236,3 @@ class BM25:
         docids = np.array(docids).reshape(bs, topk)  # (bs, topk)
         docs = np.array(docs).reshape(bs, topk)  # (bs, topk)
         return docids, docs
-
-
-def bm25search_search(self, corpus: Dict[str, Dict[str, str]], queries: Dict[str, Tuple[str, str]], top_k: int, *args, **kwargs) -> Dict[str, Dict[str, float]]:
-    # Index the corpus within elastic-search
-    # False, if the corpus has been already indexed
-    if self.initialize:
-        self.index(corpus)
-        # Sleep for few seconds so that elastic-search indexes the docs properly
-        time.sleep(self.sleep_for)
-
-    #retrieve results from BM25
-    query_ids = list(queries.keys())
-    filter_ids = [queries[qid][1] for qid in query_ids]
-    queries = [queries[qid][0] for qid in query_ids]
-
-    final_results: Dict[str, Dict[str, Tuple[float, str]]] = {}
-    for start_idx in tqdm.trange(0, len(queries), self.batch_size, desc='que', disable=kwargs.get('disable_tqdm', False)):
-        query_ids_batch = query_ids[start_idx:start_idx+self.batch_size]
-        results = self.es.lexical_multisearch(
-            texts=queries[start_idx:start_idx+self.batch_size],
-            filter_ids=filter_ids[start_idx:start_idx+self.batch_size],
-            top_hits=top_k)
-        for (query_id, hit) in zip(query_ids_batch, results):
-            scores = {}
-            for corpus_id, score, text in hit['hits']:
-                scores[corpus_id] = (score, text)
-                final_results[query_id] = scores
-
-    return final_results
-
-BM25Search.search = bm25search_search
-
-
-def elasticsearch_lexical_multisearch(self, texts: List[str], filter_ids: List[str] = None, top_hits: int = 10, skip: int = 0) -> Dict[str, object]:
-    """Multiple Query search in Elasticsearch
-
-    Args:
-        texts (List[str]): Multiple query texts
-        top_hits (int): top k hits to be retrieved
-        skip (int, optional): top hits to be skipped. Defaults to 0.
-
-    Returns:
-        Dict[str, object]: Hit results
-    """
-    request = []
-
-    assert skip + top_hits <= 10000, "Elastic-Search Window too large, Max-Size = 10000"
-
-    filter_ids = filter_ids or ([None] * len(texts))
-    for text, fid in zip(texts, filter_ids):
-        req_head = {"index" : self.index_name, "search_type": "dfs_query_then_fetch"}
-        if fid is not None:
-            req_body = {
-                "_source": True, # No need to return source objects
-                "query": {
-                    "bool": {
-                        "must": {
-                            "multi_match": {
-                                "query": text,  # matching query with both text and title fields
-                                "type": "best_fields",
-                                "fields": [self.title_key, self.text_key],
-                                "tie_breaker": 0.5
-                            },
-                        },
-                        "filter": {
-                            "term": {
-                                "_id": fid
-                            }
-                        }
-                    },
-                },
-                "size": skip + top_hits, # The same paragraph will occur in results
-            }
-        else:
-            req_body = {
-                "_source": True, # No need to return source objects
-                "query": {
-                    "multi_match": {
-                        "query": text, # matching query with both text and title fields
-                        "type": "best_fields",
-                        "fields": [self.title_key, self.text_key],
-                        "tie_breaker": 0.5
-                    }
-                },
-                "size": skip + top_hits, # The same paragraph will occur in results
-            }
-        request.extend([req_head, req_body])
-
-    res = self.es.msearch(body = request)
-
-    result = []
-    for resp in res["responses"]:
-        responses = resp["hits"]["hits"][skip:] if 'hits' in resp else []
-
-        hits = []
-        for hit in responses:
-            hits.append((hit["_id"], hit['_score'], hit['_source']['txt']))
-
-        result.append(self.hit_template(es_res=resp, hits=hits))
-    return result
-
-ElasticSearch.lexical_multisearch = elasticsearch_lexical_multisearch
-
-
-def elasticsearch_hit_template(self, es_res: Dict[str, object], hits: List[Tuple[str, float]]) -> Dict[str, object]:
-    """Hit output results template
-
-    Args:
-        es_res (Dict[str, object]): Elasticsearch response
-        hits (List[Tuple[str, float]]): Hits from Elasticsearch
-
-    Returns:
-        Dict[str, object]: Hit results
-    """
-    result = {
-        'meta': {
-            'total': es_res['hits']['total']['value'] if 'hits' in es_res else None,
-            'took': es_res['took'] if 'took' in es_res else None,
-            'num_hits': len(hits)
-        },
-        'hits': hits,
-    }
-    return result
-
-ElasticSearch.hit_template = elasticsearch_hit_template
