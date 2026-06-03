@@ -2,7 +2,6 @@ from typing import List, Dict, Any, Tuple, Union
 from operator import itemgetter
 import copy
 from collections import namedtuple
-import spacy
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 import tiktoken
 from .utils import openai_api_call, Utils
@@ -548,7 +547,6 @@ Sentence = namedtuple('Sentence', 'text start_char end_char')
 
 class ApiReturn:
     EOS = '<|endoftext|>'
-    spacy_nlp = spacy.load('en_core_web_sm')
     psentencizer = PunktSentenceTokenizer()
     use_sentencizer = 'nltk'
     min_sent_len = 5
@@ -621,9 +619,7 @@ class ApiReturn:
 
     @classmethod
     def get_sent(cls, text: str, position: str = 'begin'):
-        if cls.use_sentencizer == 'spacy':
-            sents = list(cls.spacy_nlp(text).sents)
-        elif cls.use_sentencizer == 'nltk':
+        if cls.use_sentencizer == 'nltk':
             sents = [Sentence(text[s:e], s, e) for s, e in cls.psentencizer.span_tokenize(text)]
         else:
             raise NotImplementedError
@@ -682,9 +678,7 @@ class ApiReturn:
             return self
 
         if unit == 'sentence':
-            if self.use_sentencizer == 'spacy':
-                sents = list(self.spacy_nlp(self.text).sents)
-            elif self.use_sentencizer == 'nltk':
+            if self.use_sentencizer == 'nltk':
                 sents = [Sentence(self.text[s:e], s, e) for s, e in self.psentencizer.span_tokenize(self.text)]
             else:
                 raise NotImplementedError
